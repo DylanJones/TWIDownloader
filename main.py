@@ -1,9 +1,10 @@
+#!/usr/bin/env python
 import os
 from bs4 import BeautifulSoup
 import base64
 import re
 import requests
-import argparse
+import logging
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -11,14 +12,22 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+log = logging.getLogger("downloader")
+log.addHandler(logging.StreamHandler())
+log.setLevel(logging.DEBUG)
+
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+#DOCUMENT_DIR = '/data/data/com.termux/files/home/downloads'
+DOCUMENT_DIR = '/sdcard/Books/Wandering Inn'
+PARSER = 'html.parser'
 
 
 def get_creds():
     # The file token.json stores the user's access and refresh tokens, and is
     # created automatically when the authorization flow completes for the first
     # time.
+    creds = None
     if os.path.exists('token.json'):
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
     # If there are no (valid) credentials available, let the user log in.
@@ -39,28 +48,35 @@ def parse_email(json):
     """
     """
     # Decode b64 to utf8 text
-    html = base64.urlsafe_b64decode(json['payload']['parts'][1]['body']['data']).decode('utf8')
+    html = base64.urlsafe_b64decode(json['payload']['body']['data']).decode('utf8')
+    # Bingo's emails used to come in a bit differently.
+    # html = base64.urlsafe_b64decode(json['payload']['parts'][1]['body']['data']).decode('utf8')
     # Parse
-    html = BeautifulSoup(html, features='lxml')
+    html = BeautifulSoup(html, features=PARSER)
 
     # Find the one with "password" in it
     pw_tag = html.find(string=re.compile('Password:'))
 
     # Return early if there's no password in the post
     if pw_tag is None:
-        return
-
-    # Check if the password got lumped in with this tag; if so, extract it now
-    if match := re.search(r'Password: ([^ ]+)', pw_tag.text):
-        password = match.group(1)
+        log.debug("Failed to find password tag in email!")
+        log.debug("assuming post has no password...")
+        password = ""
     else:
-        # Password wasn't in this tag, assume it's the text of the next one
-        password = pw_tag.next.text
+        # Check if the password got lumped in with this tag; if so, extract it now
+        if match := re.search(r'Password:\s*(\w+)', pw_tag.text):
+            password = match.group(1)
+        else:
+            # Password wasn't in this tag, assume it's the text of the next one
+            password = pw_tag.next.text
 
-    # Extract post link
-    link = html.find_all('a', string=re.compile('https://wanderinginn.com'))[0].text
+        log.debug(f"Password found: {repr(password)}")
 
-    return link, password
+    # Extract post link(s)
+    links = [x.text for x in html.find_all('a', string=re.compile('https://wanderinginn.com'))]
+    log.debug("Post link(s) found: %s", links)
+
+    return links, password
 
 
 def make_request(url, password):
@@ -68,7 +84,7 @@ def make_request(url, password):
     """
     sess = requests.session()
     # Submit password
-    sess.post('https://wanderinginn.com/wp-pass.php', data={'post_password': password, 'Submit': 'Enter'})
+    sess.post('https://wanderinginn.com/wp-login.php?action=postpass', data={'post_password': password, 'Submit': 'Submit'})
 
     # Get response
     return sess.get(url).content.decode('utf8')
@@ -78,8 +94,9 @@ def extract_title(html):
     """
     """
 
-    html = BeautifulSoup(html, features='lxml')
-    return html.find(class_='entry-title').text.replace('Protected: ', '')
+    html = BeautifulSoup(html, features=PARSER)
+    #return html.find(class_='entry-title').text.replace('Protected: ', '').replace('Patron Early Access: ', '').strip()
+    return html.find(property='og:title').attrs['content'].replace('Protected: ', '').replace('Patron Early Access: ', '').strip()
 
 
 def download_and_save(mail):
@@ -92,22 +109,25 @@ def download_and_save(mail):
     try:
         result = parse_email(mail)
         if not result:
+            log.info("no links found in this email, returning")
             return
-        url, password = result
+        urls, password = result
     except:
         print(f"Error parsing mail id {mail['id']} (snippet: {mail['snippet']})")
         import traceback; traceback.print_exc()
         return
 
-    post_content = make_request(url, password)
-    title = extract_title(post_content)
-    post_path = os.path.join(DOCUMENT_DIR, title + '.html')
-    print(f"Saving post {title}...")
+    for url in urls:
+        print(url)
+        post_content = make_request(url, password)
+        title = extract_title(post_content)
+        post_path = os.path.join(DOCUMENT_DIR, title + '.html')
+        print(f"Saving post {title}...")
 
-    if not os.path.exists(post_path):
-        with open(post_path, 'w') as f:
-            f.write(post_content)
-            return True
+        if not os.path.exists(post_path):
+            with open(post_path, 'w') as f:
+                f.write(post_content)
+                return True
 
 
 def main():
@@ -122,9 +142,11 @@ def main():
         service = build('gmail', 'v1', credentials=creds)
         messages = service.users().messages()
         # Get the list of emails from bingo
+        # Apparently no-reply sends them now?
         matches = messages.list(userId='me', q='from: bingo@patreon.com').execute()
 
-        for match in matches['messages']:
+        # Only the most recent 3 emails
+        for match in matches['messages'][:1]:
         # Ask for the full email
             # mail = messages.get(id=matches['messages'][0]['id'], userId='me').execute()
             mail = messages.get(id=match['id'], userId='me').execute()
@@ -138,3 +160,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
