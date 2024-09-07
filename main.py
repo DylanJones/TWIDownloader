@@ -7,6 +7,7 @@ import requests
 import logging
 
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -21,6 +22,7 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 #DOCUMENT_DIR = '/data/data/com.termux/files/home/downloads'
 DOCUMENT_DIR = '/sdcard/Books/Wandering Inn'
 PARSER = 'html.parser'
+N_RECENT = 2
 
 
 def get_creds():
@@ -30,14 +32,17 @@ def get_creds():
     creds = None
     if os.path.exists('token.json'):
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    # if the creds are expired and a refresh might work, try that first.
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except RefreshError:
+            creds = None
     # If there are no (valid) credentials available, let the user log in.
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
+        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+        creds = flow.run_local_server(port=0)
+    if creds and creds.valid:
         # Save the credentials for the next run
         with open('token.json', 'w') as token:
             token.write(creds.to_json())
@@ -83,11 +88,16 @@ def make_request(url, password):
     """
     """
     sess = requests.session()
+    sess.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0'})
     # Submit password
-    sess.post('https://wanderinginn.com/wp-login.php?action=postpass', data={'post_password': password, 'Submit': 'Submit'})
+    response = sess.post('https://wanderinginn.com/wp-login.php?action=postpass&wpe-login=true', data={'post_password': password, 'Submit': 'Submit'})
 
     # Get response
-    return sess.get(url).content.decode('utf8')
+    response = sess.get(url)
+    if response.status_code != 200:
+        print(sess.headers)
+        raise RuntimeError(f"error: got response code {response.status_code}, check password extraction and auth logic")
+    return response.content.decode('utf8')
 
 
 def extract_title(html):
@@ -118,16 +128,18 @@ def download_and_save(mail):
         return
 
     for url in urls:
-        print(url)
+        print(f"Saving post {url}...")
         post_content = make_request(url, password)
+        with open('tmp.html', 'w') as f:
+            print(os.getcwd())
+            f.write(post_content)
         title = extract_title(post_content)
         post_path = os.path.join(DOCUMENT_DIR, title + '.html')
-        print(f"Saving post {title}...")
+        # print(f"Saving post {title}...")
 
         if not os.path.exists(post_path):
             with open(post_path, 'w') as f:
                 f.write(post_content)
-                return True
 
 
 def main():
@@ -143,10 +155,11 @@ def main():
         messages = service.users().messages()
         # Get the list of emails from bingo
         # Apparently no-reply sends them now?
-        matches = messages.list(userId='me', q='from: bingo@patreon.com').execute()
+        matches = messages.list(userId='me', q='from: bingo@patreon.com').execute()['messages'][:N_RECENT]
+        matches += messages.list(userId='me', q='from: no-reply@patreon.com').execute()['messages'][:N_RECENT]
 
         # Only the most recent 3 emails
-        for match in matches['messages'][:1]:
+        for match in matches:
         # Ask for the full email
             # mail = messages.get(id=matches['messages'][0]['id'], userId='me').execute()
             mail = messages.get(id=match['id'], userId='me').execute()
