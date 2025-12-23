@@ -5,6 +5,8 @@ import base64
 import re
 import requests
 import logging
+from argparse import ArgumentParser
+from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -15,12 +17,11 @@ from googleapiclient.errors import HttpError
 
 log = logging.getLogger("downloader")
 log.addHandler(logging.StreamHandler())
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-#DOCUMENT_DIR = '/data/data/com.termux/files/home/downloads'
-DOCUMENT_DIR = '/sdcard/Books/Wandering Inn'
+DOCUMENT_DIR = Path('/sdcard/Books/Wandering Inn')
 PARSER = 'html.parser'
 N_RECENT = 2
 
@@ -73,7 +74,10 @@ def parse_email(json):
             password = match.group(1)
         else:
             # Password wasn't in this tag, assume it's the text of the next one
-            password = pw_tag.next.text
+            pw_tag = pw_tag.next
+            while not pw_tag.text.strip().isalnum():
+                pw_tag = pw_tag.next
+            password = pw_tag.text.strip()
 
         log.debug(f"Password found: {repr(password)}")
 
@@ -95,7 +99,7 @@ def make_request(url, password):
     # Get response
     response = sess.get(url)
     if response.status_code != 200:
-        print(sess.headers)
+        log.debug(sess.headers)
         raise RuntimeError(f"error: got response code {response.status_code}, check password extraction and auth logic")
     return response.content.decode('utf8')
 
@@ -123,23 +127,25 @@ def download_and_save(mail):
             return
         urls, password = result
     except:
-        print(f"Error parsing mail id {mail['id']} (snippet: {mail['snippet']})")
+        log.error(f"Error parsing mail id {mail['id']} (snippet: {mail['snippet']})")
         import traceback; traceback.print_exc()
         return
 
+    new_file = False
     for url in urls:
-        print(f"Saving post {url}...")
+        log.debug(f"post url: {url}...")
         post_content = make_request(url, password)
         with open('tmp.html', 'w') as f:
-            print(os.getcwd())
             f.write(post_content)
         title = extract_title(post_content)
-        post_path = os.path.join(DOCUMENT_DIR, title + '.html')
-        # print(f"Saving post {title}...")
+        post_path = DOCUMENT_DIR / (title + '.html')
+        log.info(f"Saving post {title}...")
 
         if not os.path.exists(post_path):
+            new_file = True
             with open(post_path, 'w') as f:
                 f.write(post_content)
+    return new_file
 
 
 def main():
@@ -147,30 +153,37 @@ def main():
     """Shows basic usage of the Gmail API.
     Lists the user's Gmail labels.
     """
+    parser = ArgumentParser('TWIDownloader')
+    parser.add_argument('--verbose', action="store_true", default=False)
+    parser.add_argument("-n", type=int, help="number of posts to download", default=3)
+    args = parser.parse_args()
+
     creds = get_creds()
 
-    try:
-        # Call the Gmail API
-        service = build('gmail', 'v1', credentials=creds)
-        messages = service.users().messages()
-        # Get the list of emails from bingo
-        # Apparently no-reply sends them now?
-        matches = messages.list(userId='me', q='from: bingo@patreon.com').execute()['messages'][:N_RECENT]
-        matches += messages.list(userId='me', q='from: no-reply@patreon.com').execute()['messages'][:N_RECENT]
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
 
-        # Only the most recent 3 emails
-        for match in matches:
+    # Call the Gmail API
+    service = build('gmail', 'v1', credentials=creds)
+    messages = service.users().messages()
+    # Get the list of emails from bingo
+    # Apparently no-reply sends them now?
+    matches = messages.list(userId='me', q='from: bingo@patreon.com').execute()['messages'][:args.n]
+    matches += messages.list(userId='me', q='from: no-reply@patreon.com').execute()['messages'][:args.n]
+
+    # Only the most recent 3 emails
+    n_new = 0
+    for match in matches:
         # Ask for the full email
-            # mail = messages.get(id=matches['messages'][0]['id'], userId='me').execute()
-            mail = messages.get(id=match['id'], userId='me').execute()
-            download_and_save(mail)
-
-
-    except HttpError as error:
-        # TODO(developer) - Handle errors from gmail API.
-        print(f'An error occurred: {error}')
+        mail = messages.get(id=match['id'], userId='me').execute()
+        res = download_and_save(mail)
+        n_new += 1 if res else 0
+    # the only print statement in our program, for other scripts to consume :p
+    print(n_new)
 
 
 if __name__ == '__main__':
+    f = Path(__file__).absolute()
+    os.chdir(f.parent)
     main()
 
